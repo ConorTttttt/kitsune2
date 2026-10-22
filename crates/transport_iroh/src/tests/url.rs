@@ -1,12 +1,14 @@
 use crate::IrohTransport;
 use crate::url::endpoint_from_url;
 use crate::url::{
-    SpaceRelay, ble_peer_url, canonicalize_relay_url, get_url_with_first_relay,
-    is_ble_peer_url, is_transport_own_relay, per_space_relay,
+    SpaceRelay, ble_peer_url, canonicalize_relay_url, direct_peer_addr,
+    direct_peer_url, get_url_with_first_relay, is_ble_peer_url,
+    is_transport_own_relay, per_space_relay,
 };
 use iroh::{EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use kitsune2_api::{Id, SpaceId, Url};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::str::FromStr;
 
 fn test_endpoint_id() -> EndpointId {
@@ -232,6 +234,88 @@ fn endpoint_from_ble_peer_url_has_no_transport_addrs() {
 fn own_url_for_preflight_to_ble_peer_is_own_ble_url() {
     let own_url = ble_peer_url(test_endpoint_id()).unwrap();
     let peer_url = ble_peer_url(
+        EndpointId::from_str(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let result = IrohTransport::own_url_for_preflight(
+        &peer_url,
+        &HashMap::new(),
+        &Some(own_url.clone()),
+    );
+    assert_eq!(result, Some(own_url));
+}
+
+#[test]
+fn direct_peer_url_round_trips_an_ipv4_address() {
+    let endpoint_id = test_endpoint_id();
+    let addr: SocketAddr = "192.168.137.1:47001".parse().unwrap();
+    let url = direct_peer_url(addr, endpoint_id).unwrap();
+    assert_eq!(
+        url.as_str(),
+        format!("http://192.168.137.1:47001/direct/{endpoint_id}")
+    );
+    assert_eq!(url.peer_id(), Some(endpoint_id.to_string().as_str()));
+    assert_eq!(direct_peer_addr(&url), Some(addr));
+}
+
+#[test]
+fn direct_peer_url_round_trips_an_ipv6_address() {
+    let endpoint_id = test_endpoint_id();
+    let addr: SocketAddr = "[fd00::1]:47001".parse().unwrap();
+    let url = direct_peer_url(addr, endpoint_id).unwrap();
+    assert_eq!(
+        url.as_str(),
+        format!("http://[fd00::1]:47001/direct/{endpoint_id}")
+    );
+    assert_eq!(direct_peer_addr(&url), Some(addr));
+}
+
+/// The endpoint ID and the exact socket address survive the trip through a
+/// URL, and nothing else is added: no relay to fall back to.
+#[test]
+fn endpoint_from_direct_peer_url_has_only_its_socket_addr() {
+    let endpoint_id = test_endpoint_id();
+    let addr: SocketAddr = "10.42.0.1:47001".parse().unwrap();
+    let url = direct_peer_url(addr, endpoint_id).unwrap();
+    let result = endpoint_from_url(&url).unwrap();
+    assert_eq!(result.id, endpoint_id);
+    assert_eq!(
+        result.addrs.iter().collect::<Vec<_>>(),
+        vec![&TransportAddr::Ip(addr)]
+    );
+}
+
+#[test]
+fn urls_that_only_look_direct_are_not_direct() {
+    let endpoint_id = test_endpoint_id();
+    for url in [
+        // A relay with a host name, serving a /direct/ path.
+        format!("https://relay.example:443/direct/{endpoint_id}"),
+        // A relay peer URL on an IP literal, without the marker.
+        format!("http://192.168.137.1:3456/{endpoint_id}"),
+        // A deeper path.
+        format!("http://192.168.137.1:3456/relay/direct/{endpoint_id}"),
+    ] {
+        let url = Url::from_str(&url).unwrap();
+        assert_eq!(direct_peer_addr(&url), None, "{url}");
+    }
+    assert_eq!(direct_peer_addr(&ble_peer_url(endpoint_id).unwrap()), None);
+}
+
+/// Direct peers are each at their own address, so there is no shared relay
+/// to match: the preflight always offers our own URL.
+#[test]
+fn own_url_for_preflight_to_direct_peer_is_own_url() {
+    let own_url = direct_peer_url(
+        "192.168.137.1:47001".parse().unwrap(),
+        test_endpoint_id(),
+    )
+    .unwrap();
+    let peer_url = direct_peer_url(
+        "192.168.137.20:47001".parse().unwrap(),
         EndpointId::from_str(
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         )

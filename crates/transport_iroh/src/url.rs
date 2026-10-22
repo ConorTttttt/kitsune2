@@ -1,5 +1,6 @@
 use iroh::{EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use kitsune2_api::{K2Error, K2Result, Url};
+use std::net::SocketAddr;
 use std::str::FromStr;
 
 pub(super) fn get_url_with_first_relay(
@@ -85,6 +86,33 @@ pub(super) fn is_ble_peer_url(url: &Url) -> bool {
     url.addr() == BLE_PEER_ADDR
 }
 
+/// Path segment that marks a peer URL as the direct IP socket address of an
+/// endpoint that has no relay, as in
+/// `http://192.168.137.1:47001/direct/<endpoint-id>`.
+pub(super) const DIRECT_PEER_PATH: &str = "direct";
+
+/// Construct the kitsune2 peer URL of an endpoint reached directly at `addr`.
+pub(super) fn direct_peer_url(
+    addr: SocketAddr,
+    endpoint_id: EndpointId,
+) -> K2Result<Url> {
+    Url::from_str(format!("http://{addr}/{DIRECT_PEER_PATH}/{endpoint_id}"))
+}
+
+/// The socket address in a direct peer URL, or `None` for any other URL.
+///
+/// Only an IP literal host counts, so a relay that happens to serve a
+/// `/direct/` path under a host name is never taken for a direct address.
+pub(super) fn direct_peer_addr(url: &Url) -> Option<SocketAddr> {
+    let (_, rest) = url.as_str().split_once("://")?;
+    let (addr, path) = rest.split_once('/')?;
+    let (marker, peer_id) = path.split_once('/')?;
+    if marker != DIRECT_PEER_PATH || peer_id.contains('/') {
+        return None;
+    }
+    addr.parse().ok()
+}
+
 /// Reconstruct an iroh EndpointAddr from a kitsune2 peer URL.
 ///
 /// The peer URL encodes the full relay path, so the relay URL can be
@@ -92,7 +120,8 @@ pub(super) fn is_ble_peer_url(url: &Url) -> bool {
 /// relay URL, and the last segment is the endpoint ID.
 ///
 /// A BLE peer URL yields an address with no transport addresses, so that
-/// iroh asks the BLE address lookup for a path to the endpoint.
+/// iroh asks the BLE address lookup for a path to the endpoint. A direct peer
+/// URL yields its socket address and nothing else.
 pub(super) fn endpoint_from_url(url: &Url) -> K2Result<EndpointAddr> {
     let peer_id = url
         .peer_id()
@@ -103,6 +132,13 @@ pub(super) fn endpoint_from_url(url: &Url) -> K2Result<EndpointAddr> {
 
     if is_ble_peer_url(url) {
         return Ok(EndpointAddr::new(endpoint_id));
+    }
+
+    if let Some(addr) = direct_peer_addr(url) {
+        return Ok(EndpointAddr::from_parts(
+            endpoint_id,
+            [TransportAddr::Ip(addr)],
+        ));
     }
 
     let relay_url = relay_url_from_peer_url(url)?;

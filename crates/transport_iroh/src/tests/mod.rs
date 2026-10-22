@@ -69,6 +69,78 @@ fn validate_ble_only_requires_the_ble_feature() {
     assert_eq!(builder.validate_config().is_ok(), cfg!(feature = "ble"));
 }
 
+fn direct_config_builder(direct_bind_addr: &str, ble_only: bool) -> Builder {
+    let builder = Builder {
+        transport: IrohTransportFactory::create(),
+        ..kitsune2_core::default_test_builder()
+    };
+    builder
+        .config
+        .set_module_config(&IrohTransportModConfig {
+            iroh_transport: IrohTransportConfig {
+                direct_bind_addr: Some(direct_bind_addr.to_string()),
+                ble_only,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    builder
+}
+
+#[test]
+fn direct_bind_addr_defaults_to_none_when_absent() {
+    let config: IrohTransportModConfig =
+        serde_json::from_value(serde_json::json!({
+            "irohTransport": {
+                "relayUrl": "https://relay.example/",
+                "relayAllowPlainText": false,
+                "maxFrameBytes": 1024,
+                "connectTimeoutS": 60,
+            }
+        }))
+        .unwrap();
+
+    assert_eq!(config.iroh_transport.direct_bind_addr, None);
+}
+
+#[test]
+fn validate_accepts_interface_direct_bind_addrs() {
+    for addr in ["192.168.137.1:47001", "127.0.0.1:0", "[fd00::1]:47001"] {
+        assert!(
+            direct_config_builder(addr, false).validate_config().is_ok(),
+            "{addr}"
+        );
+    }
+}
+
+#[test]
+fn validate_rejects_unusable_direct_bind_addrs() {
+    for addr in [
+        "not an address",
+        "192.168.137.1",
+        "0.0.0.0:47001",
+        "[::]:47001",
+        "224.0.0.1:47001",
+        "[fe80::1%3]:47001",
+    ] {
+        assert!(
+            direct_config_builder(addr, false)
+                .validate_config()
+                .is_err(),
+            "{addr}"
+        );
+    }
+}
+
+#[test]
+fn validate_rejects_direct_bind_addr_with_ble_only() {
+    assert!(
+        direct_config_builder("192.168.137.1:47001", true)
+            .validate_config()
+            .is_err()
+    );
+}
+
 #[test]
 fn validate_allowed_plain_text_relay_url() {
     let builder = Builder {

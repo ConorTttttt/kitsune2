@@ -322,6 +322,23 @@ pub mod config {
         #[serde(default)]
         #[cfg_attr(feature = "schema", schemars(default))]
         pub ble_only: bool,
+
+        /// Reach peers directly over IP, with no relay, through a single
+        /// socket bound to this address, for example `192.168.137.1:47001`.
+        ///
+        /// The endpoint's only IP socket is bound to this address, so all
+        /// traffic uses the interface that owns it, and `relay_url` is
+        /// ignored. The IP must be a specific interface address. Port `0`
+        /// picks a free port. Peer URLs take the form
+        /// `http://<ip>:<port>/direct/<endpoint-id>`, and are known as soon
+        /// as the endpoint binds, so peers can meet through a bootstrap
+        /// server on the same link or by exchanging agent infos. Can not be
+        /// combined with `ble_only`.
+        ///
+        /// Default: `None`.
+        #[serde(default)]
+        #[cfg_attr(feature = "schema", schemars(default))]
+        pub direct_bind_addr: Option<String>,
     }
 
     fn default_relay_keepalive_interval_s() -> u32 {
@@ -339,6 +356,7 @@ pub mod config {
                 relay_keepalive_interval_s: default_relay_keepalive_interval_s(
                 ),
                 ble_only: false,
+                direct_bind_addr: None,
             }
         }
     }
@@ -388,6 +406,15 @@ impl TransportFactory for IrohTransportFactory {
             ));
         }
 
+        if let Some(addr) = &config.iroh_transport.direct_bind_addr {
+            if config.iroh_transport.ble_only {
+                return Err(K2Error::other(
+                    "bleOnly and directBindAddr can not be combined",
+                ));
+            }
+            parse_direct_bind_addr(addr)?;
+        }
+
         if let Some(relay) = &config.iroh_transport.relay_url {
             let relay_server_url = ::url::Url::parse(relay)
                 .map_err(|err| K2Error::other_src("Invalid relay URL", err))?;
@@ -433,6 +460,26 @@ impl TransportFactory for IrohTransportFactory {
             Ok(DefaultTransport::create(&handler, imp))
         })
     }
+}
+
+/// Parse a `direct_bind_addr`, which must name one interface's address.
+fn parse_direct_bind_addr(addr: &str) -> K2Result<std::net::SocketAddr> {
+    let addr: std::net::SocketAddr = addr.parse().map_err(|err| {
+        K2Error::other_src(format!("Invalid directBindAddr {addr}"), err)
+    })?;
+    if addr.ip().is_unspecified() || addr.ip().is_multicast() {
+        return Err(K2Error::other(format!(
+            "directBindAddr {addr} must be the address of one interface"
+        )));
+    }
+    if let std::net::SocketAddr::V6(v6) = addr
+        && v6.scope_id() != 0
+    {
+        return Err(K2Error::other(format!(
+            "directBindAddr {addr}: scoped IPv6 addresses are not supported"
+        )));
+    }
+    Ok(addr)
 }
 
 type Connections = ConnectionRegistry<ConnectionContext>;
@@ -513,7 +560,14 @@ impl IrohTransport {
         // Determine whether we need to authenticate for relay access.
         // Authentication is required when both a relay URL and auth material
         // are provided.
+        let direct_bind_addr = config
+            .direct_bind_addr
+            .as_deref()
+            .map(parse_direct_bind_addr)
+            .transpose()?;
+
         let needs_relay_auth = !config.ble_only
+            && direct_bind_addr.is_none()
             && config.relay_url.is_some()
             && auth_material.is_some();
 
@@ -522,6 +576,18 @@ impl IrohTransport {
         // BLE reaches peers without a relay.
         let mut builder = if config.ble_only {
             Endpoint::builder(Minimal).relay_mode(RelayMode::Disabled)
+        } else if let Some(addr) = direct_bind_addr {
+            // Direct peers are reached at their bound address, without a
+            // relay, and only over the interface that owns this address.
+            Endpoint::builder(Minimal)
+                .relay_mode(RelayMode::Disabled)
+                .clear_ip_transports()
+                .bind_addr(addr)
+                .map_err(|err| {
+                    K2Error::other(format!(
+                        "Invalid directBindAddr {addr}: {err}"
+                    ))
+                })?
         } else if let Some(relay_url) = &config.relay_url {
             if needs_relay_auth {
                 // Start with an empty relay map so the endpoint binds without
@@ -633,14 +699,35 @@ impl IrohTransport {
             None
         };
 
+        let direct_url = match direct_bind_addr {
+            Some(addr) => {
+                // Port 0 asks for a free port, so look up the one bound.
+                let bound = endpoint
+                    .bound_sockets()
+                    .into_iter()
+                    .find(|bound| bound.ip() == addr.ip())
+                    .ok_or_else(|| {
+                        K2Error::other(format!(
+                            "No socket was bound on directBindAddr {addr}"
+                        ))
+                    })?;
+                let url = direct_peer_url(bound, endpoint.id())?;
+                info!(%url, "Reaching peers directly over IP, without a relay");
+                Some(url)
+            }
+            None => None,
+        };
+
         let endpoint = Arc::new(IrohEndpoint::new(endpoint));
 
-        // A BLE endpoint is reachable at its URL as soon as it is bound. A
-        // relay endpoint learns its URL from the relay, see the watcher task.
+        // A BLE or direct endpoint is reachable at its URL as soon as it is
+        // bound. A relay endpoint learns its URL from the relay, see the
+        // watcher task.
         #[cfg(feature = "ble")]
-        let initial_url = ble.as_ref().map(|ble| ble.url().clone());
+        let initial_url =
+            ble.as_ref().map(|ble| ble.url().clone()).or(direct_url);
         #[cfg(not(feature = "ble"))]
-        let initial_url = None;
+        let initial_url = direct_url;
         let local_url = Arc::new(RwLock::new(initial_url));
         let connections = ConnectionRegistry::new();
         let connection_locks = Arc::new(Mutex::new(HashMap::new()));
@@ -884,6 +971,12 @@ impl IrohTransport {
         space_relays: &HashMap<SpaceId, (RelayUrl, Option<Url>)>,
         global_url: &Option<Url>,
     ) -> Option<Url> {
+        // A direct peer has no relay to match: it is reached at its own
+        // address, and reaches us at ours.
+        if direct_peer_addr(peer_url).is_some() {
+            return global_url.clone();
+        }
+
         let peer_relay = match relay_url_from_peer_url(peer_url) {
             Ok(r) => r,
             Err(_) => {
@@ -1362,11 +1455,17 @@ impl TxImp for IrohTransport {
             #[cfg(feature = "ble")]
             let backend = if self.ble.is_some() {
                 "iroh-ble"
+            } else if self.config.direct_bind_addr.is_some() {
+                "iroh-direct"
             } else {
                 "iroh"
             };
             #[cfg(not(feature = "ble"))]
-            let backend = "iroh";
+            let backend = if self.config.direct_bind_addr.is_some() {
+                "iroh-direct"
+            } else {
+                "iroh"
+            };
             Ok(TransportStats {
                 backend: backend.to_string(),
                 peer_urls,
@@ -1380,8 +1479,9 @@ impl TxImp for IrohTransport {
         space_id: SpaceId,
         config: &Config,
     ) -> BoxFut<'_, K2Result<()>> {
-        // BLE reaches peers without relays, so there is none to configure.
-        if self.config.ble_only {
+        // BLE and direct endpoints reach peers without relays, so there is
+        // none to configure.
+        if self.config.ble_only || self.config.direct_bind_addr.is_some() {
             return Box::pin(async { Ok(()) });
         }
 
