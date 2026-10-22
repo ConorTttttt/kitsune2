@@ -1,8 +1,8 @@
 use crate::IrohTransport;
 use crate::url::endpoint_from_url;
 use crate::url::{
-    SpaceRelay, canonicalize_relay_url, get_url_with_first_relay,
-    is_transport_own_relay, per_space_relay,
+    SpaceRelay, ble_peer_url, canonicalize_relay_url, get_url_with_first_relay,
+    is_ble_peer_url, is_transport_own_relay, per_space_relay,
 };
 use iroh::{EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use kitsune2_api::{Id, SpaceId, Url};
@@ -193,6 +193,57 @@ fn endpoint_from_url_valid_http() {
         ),
         "expected relay url but got {actual_transport_addr:?}"
     );
+}
+
+#[test]
+fn ble_peer_url_is_canonical_and_names_the_endpoint() {
+    let endpoint_id = test_endpoint_id();
+    let url = ble_peer_url(endpoint_id).unwrap();
+    assert_eq!(
+        url.as_str(),
+        format!("https://ble.invalid:443/{endpoint_id}")
+    );
+    assert_eq!(url.peer_id(), Some(endpoint_id.to_string().as_str()));
+    assert!(is_ble_peer_url(&url));
+}
+
+#[test]
+fn relay_peer_url_is_not_a_ble_peer_url() {
+    let endpoint_id = test_endpoint_id();
+    let url = Url::from_str(format!("https://example.com:443/{endpoint_id}"))
+        .unwrap();
+    assert!(!is_ble_peer_url(&url));
+}
+
+/// A BLE peer is dialed by endpoint ID alone, so that iroh asks the BLE
+/// address lookup for the path to it, never a relay.
+#[test]
+fn endpoint_from_ble_peer_url_has_no_transport_addrs() {
+    let endpoint_id = test_endpoint_id();
+    let url = ble_peer_url(endpoint_id).unwrap();
+    let result = endpoint_from_url(&url).unwrap();
+    assert_eq!(result.id, endpoint_id);
+    assert!(result.addrs.is_empty(), "got {:?}", result.addrs);
+}
+
+/// Both ends of a BLE connection advertise BLE URLs, so the preflight picks
+/// our own BLE URL for a BLE peer.
+#[test]
+fn own_url_for_preflight_to_ble_peer_is_own_ble_url() {
+    let own_url = ble_peer_url(test_endpoint_id()).unwrap();
+    let peer_url = ble_peer_url(
+        EndpointId::from_str(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let result = IrohTransport::own_url_for_preflight(
+        &peer_url,
+        &HashMap::new(),
+        &Some(own_url.clone()),
+    );
+    assert_eq!(result, Some(own_url));
 }
 
 #[test]

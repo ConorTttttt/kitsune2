@@ -181,6 +181,8 @@ fn build_transport(
         space_relay_keepalives: Arc::new(Mutex::new(HashMap::new())),
         config,
         space_relays: Arc::new(RwLock::new(HashMap::new())),
+        #[cfg(feature = "ble")]
+        ble: None,
     }
 }
 

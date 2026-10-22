@@ -34,6 +34,42 @@ fn validate_bad_relay_url() {
 }
 
 #[test]
+fn ble_only_defaults_to_false_when_absent() {
+    let config: IrohTransportModConfig =
+        serde_json::from_value(serde_json::json!({
+            "irohTransport": {
+                "relayUrl": "https://relay.example/",
+                "relayAllowPlainText": false,
+                "maxFrameBytes": 1024,
+                "connectTimeoutS": 60,
+            }
+        }))
+        .unwrap();
+
+    assert!(!config.iroh_transport.ble_only);
+}
+
+#[test]
+fn validate_ble_only_requires_the_ble_feature() {
+    let builder = Builder {
+        transport: IrohTransportFactory::create(),
+        ..kitsune2_core::default_test_builder()
+    };
+
+    builder
+        .config
+        .set_module_config(&IrohTransportModConfig {
+            iroh_transport: IrohTransportConfig {
+                ble_only: true,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+
+    assert_eq!(builder.validate_config().is_ok(), cfg!(feature = "ble"));
+}
+
+#[test]
 fn validate_allowed_plain_text_relay_url() {
     let builder = Builder {
         transport: IrohTransportFactory::create(),

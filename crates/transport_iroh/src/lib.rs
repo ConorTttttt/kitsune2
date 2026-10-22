@@ -219,6 +219,8 @@ use std::{
 use tokio::task::AbortHandle;
 use tracing::{debug, error, info, warn};
 
+#[cfg(feature = "ble")]
+mod ble;
 mod close_code;
 mod frame;
 use frame::*;
@@ -307,6 +309,19 @@ pub mod config {
         #[serde(default = "default_relay_keepalive_interval_s")]
         #[cfg_attr(feature = "schema", schemars(default))]
         pub relay_keepalive_interval_s: u32,
+
+        /// Use Bluetooth Low Energy as the only transport.
+        ///
+        /// The endpoint then has no IP sockets and no relay, and
+        /// `relay_url` is ignored. Peers are reached by endpoint ID over
+        /// BLE, and their URLs take the form
+        /// `https://ble.invalid:443/<endpoint-id>`. Requires the `ble`
+        /// feature.
+        ///
+        /// Default: false.
+        #[serde(default)]
+        #[cfg_attr(feature = "schema", schemars(default))]
+        pub ble_only: bool,
     }
 
     fn default_relay_keepalive_interval_s() -> u32 {
@@ -323,6 +338,7 @@ pub mod config {
                 auth_material_relay_base64: None,
                 relay_keepalive_interval_s: default_relay_keepalive_interval_s(
                 ),
+                ble_only: false,
             }
         }
     }
@@ -363,6 +379,12 @@ impl TransportFactory for IrohTransportFactory {
         if config.iroh_transport.relay_keepalive_interval_s == 0 {
             return Err(K2Error::other(
                 "Relay keepalive interval must be greater than zero",
+            ));
+        }
+
+        if config.iroh_transport.ble_only && !cfg!(feature = "ble") {
+            return Err(K2Error::other(
+                "bleOnly is set, but the iroh transport was built without the ble feature",
             ));
         }
 
@@ -451,6 +473,9 @@ struct IrohTransport {
     space_relay_keepalives: Arc<Mutex<HashMap<RelayUrl, AbortHandle>>>,
     config: IrohTransportConfig,
     space_relays: SpaceRelays,
+    /// The BLE transport, when it is the endpoint's only transport.
+    #[cfg(feature = "ble")]
+    ble: Option<ble::Ble>,
 }
 
 impl Drop for IrohTransport {
@@ -488,12 +513,16 @@ impl IrohTransport {
         // Determine whether we need to authenticate for relay access.
         // Authentication is required when both a relay URL and auth material
         // are provided.
-        let needs_relay_auth =
-            config.relay_url.is_some() && auth_material.is_some();
+        let needs_relay_auth = !config.ble_only
+            && config.relay_url.is_some()
+            && auth_material.is_some();
 
         // If a relay server is configured, only use that.
         // Otherwise, use the default relay servers provided by n0.
-        let mut builder = if let Some(relay_url) = &config.relay_url {
+        // BLE reaches peers without a relay.
+        let mut builder = if config.ble_only {
+            Endpoint::builder(Minimal).relay_mode(RelayMode::Disabled)
+        } else if let Some(relay_url) = &config.relay_url {
             if needs_relay_auth {
                 // Start with an empty relay map so the endpoint binds without
                 // immediately connecting to the relay. The relay transport is
@@ -532,6 +561,15 @@ impl IrohTransport {
                 iroh_relay::tls::CaTlsConfig::insecure_skip_verify(),
             );
         }
+
+        #[cfg(feature = "ble")]
+        let ble = if config.ble_only {
+            let (ble_builder, ble) = ble::Ble::attach(builder).await?;
+            builder = ble_builder;
+            Some(ble)
+        } else {
+            None
+        };
 
         let endpoint = builder.bind().await.map_err(|err| {
             K2Error::other_src("Failed to bind iroh endpoint", err)
@@ -596,7 +634,14 @@ impl IrohTransport {
         };
 
         let endpoint = Arc::new(IrohEndpoint::new(endpoint));
-        let local_url = Arc::new(RwLock::new(None));
+
+        // A BLE endpoint is reachable at its URL as soon as it is bound. A
+        // relay endpoint learns its URL from the relay, see the watcher task.
+        #[cfg(feature = "ble")]
+        let initial_url = ble.as_ref().map(|ble| ble.url().clone());
+        #[cfg(not(feature = "ble"))]
+        let initial_url = None;
+        let local_url = Arc::new(RwLock::new(initial_url));
         let connections = ConnectionRegistry::new();
         let connection_locks = Arc::new(Mutex::new(HashMap::new()));
 
@@ -657,6 +702,8 @@ impl IrohTransport {
             space_relay_keepalives: Arc::new(Mutex::new(HashMap::new())),
             config,
             space_relays,
+            #[cfg(feature = "ble")]
+            ble,
         });
         Ok(out)
     }
@@ -1312,8 +1359,16 @@ impl TxImp for IrohTransport {
                     }
                 })
                 .collect();
+            #[cfg(feature = "ble")]
+            let backend = if self.ble.is_some() {
+                "iroh-ble"
+            } else {
+                "iroh"
+            };
+            #[cfg(not(feature = "ble"))]
+            let backend = "iroh";
             Ok(TransportStats {
-                backend: "iroh".to_string(),
+                backend: backend.to_string(),
                 peer_urls,
                 connections: stat_connections,
             })
@@ -1325,6 +1380,11 @@ impl TxImp for IrohTransport {
         space_id: SpaceId,
         config: &Config,
     ) -> BoxFut<'_, K2Result<()>> {
+        // BLE reaches peers without relays, so there is none to configure.
+        if self.config.ble_only {
+            return Box::pin(async { Ok(()) });
+        }
+
         let per_space_config: Option<IrohTransportModConfig> =
             config.get_module_config().ok();
 
