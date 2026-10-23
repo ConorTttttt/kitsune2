@@ -242,6 +242,13 @@ async fn send_until_received(
 /// address is gone, the endpoint must not mark the peers it can not reach
 /// unresponsive, or it would not dial them again once the link is back.
 ///
+/// Both endpoints share one namespace here, so once the outage is over they
+/// may also reach each other through their loopback sockets, which two
+/// machines can not. The test pins down the two failures above; recovery of
+/// the link path itself between separate machines is covered by
+/// holochain-wifi-direct-demo's `scripts/outage-test.sh`, which gives each
+/// node its own namespace.
+///
 /// Changing addresses needs its own network namespace, so the test is
 /// ignored by default. Run it, as an unprivileged user, with:
 ///
