@@ -13,12 +13,13 @@ use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 /// A direct-mode transport, its URL, the space notifications it receives,
-/// and the peers it marked unresponsive.
+/// the peers it marked unresponsive, and the reasons it disconnected peers.
 struct Node {
     transport: DynTransport,
     url: Url,
     received: UnboundedReceiver<(Url, Bytes)>,
     unresponsive: Arc<Mutex<Vec<Url>>>,
+    disconnects: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 async fn direct_node(bind_addr: &str) -> Node {
@@ -45,7 +46,12 @@ async fn direct_node(bind_addr: &str) -> Node {
     let (sender, received) = unbounded_channel();
     let unresponsive = Arc::new(Mutex::new(Vec::new()));
     let marks = unresponsive.clone();
+    let disconnects = Arc::new(Mutex::new(Vec::new()));
+    let reasons = disconnects.clone();
     let handler = Arc::new(MockTxHandler {
+        peer_disconnect: Arc::new(move |_peer, reason| {
+            reasons.lock().expect("poison").push(reason);
+        }),
         recv_space_notify: Arc::new(move |peer, _space_id, data| {
             sender.send((peer, data)).unwrap();
             Ok(())
@@ -71,6 +77,7 @@ async fn direct_node(bind_addr: &str) -> Node {
         url,
         received,
         unresponsive,
+        disconnects,
     }
 }
 
@@ -326,8 +333,26 @@ async fn direct_endpoint_survives_its_link_address_going_away() {
         Vec::<Url>::new()
     );
 
-    // The link comes back with the same address.
+    // The link comes back with the same address, and node 1 makes its
+    // connections again rather than trusting ones that lived through the
+    // outage.
     ip("addr add 10.77.0.1/24 dev d0");
+    let reconnected = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if node_1.disconnects.lock().expect("poison").iter().any(|r| {
+                r.as_deref() == Some("direct link restored, reconnecting")
+            }) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        reconnected.is_ok(),
+        "node 1 did not reconnect after its address returned: {:?}",
+        node_1.disconnects.lock().expect("poison")
+    );
     send_until_received(
         &node_1,
         &mut node_2,

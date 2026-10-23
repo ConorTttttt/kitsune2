@@ -256,6 +256,10 @@ pub(crate) const RELAY_NOT_CONNECTED_ERR: &str =
 /// because its own link address is not assigned to any interface.
 const DIRECT_LINK_DOWN_ERR: &str =
     "own direct address is gone, skipping to avoid false unresponsive mark";
+/// How often a direct endpoint checks that its link address is assigned.
+const DIRECT_LINK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// Close reason sent to peers when the link address returns.
+const DIRECT_LINK_RESTORED_REASON: &str = "direct link restored, reconnecting";
 
 /// IrohTransport configuration types
 pub mod config {
@@ -549,6 +553,9 @@ struct IrohTransport {
     watch_addr_task: AbortHandle,
     accept_task: AbortHandle,
     relay_keepalive_task: Option<AbortHandle>,
+    /// In direct mode, watches the link address; see
+    /// [`IrohTransport::spawn_direct_link_task`].
+    direct_link_task: Option<AbortHandle>,
     /// Keepalive tasks for per-space relays, keyed by relay URL.
     space_relay_keepalives: Arc<Mutex<HashMap<RelayUrl, AbortHandle>>>,
     config: IrohTransportConfig,
@@ -564,6 +571,9 @@ impl Drop for IrohTransport {
         self.watch_addr_task.abort();
         self.accept_task.abort();
         if let Some(handle) = self.relay_keepalive_task.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.direct_link_task.take() {
             handle.abort();
         }
         self.space_relay_keepalives
@@ -825,6 +835,10 @@ impl IrohTransport {
             )
         });
 
+        let direct_link_task = direct_bind_addr.map(|addr| {
+            Self::spawn_direct_link_task(addr.ip(), connections.clone())
+        });
+
         let out = Arc::new(Self {
             endpoint,
             handler,
@@ -834,6 +848,7 @@ impl IrohTransport {
             watch_addr_task,
             accept_task,
             relay_keepalive_task,
+            direct_link_task,
             space_relay_keepalives: Arc::new(Mutex::new(HashMap::new())),
             config,
             space_relays,
@@ -841,6 +856,48 @@ impl IrohTransport {
             ble,
         });
         Ok(out)
+    }
+
+    /// Watch a direct endpoint's link address, and when it comes back after
+    /// being gone, close every connection so that each is made again.
+    ///
+    /// A QUIC connection that lived through the outage can come back
+    /// half-working: its only path could not be closed while the address was
+    /// gone, and afterwards data may flow one way only. A new connection
+    /// costs one handshake on a link that has just returned. The graceful
+    /// close tells the peer not to mark us unresponsive, and the next send
+    /// in either direction connects again.
+    fn spawn_direct_link_task(
+        ip: std::net::IpAddr,
+        connections: Connections,
+    ) -> AbortHandle {
+        tokio::spawn(async move {
+            let mut was_up = true;
+            loop {
+                tokio::time::sleep(DIRECT_LINK_CHECK_INTERVAL).await;
+                let up = is_local_addr_available(ip);
+                if was_up && !up {
+                    info!(%ip, "Direct link address is gone; waiting for it to return");
+                } else if !was_up && up {
+                    let peers = connections.active_peers();
+                    info!(
+                        %ip,
+                        peers = peers.len(),
+                        "Direct link address is back; reconnecting to peers"
+                    );
+                    for peer in peers {
+                        if let Some(ctx) = connections.take(&peer) {
+                            ctx.disconnect(
+                                close_code::CloseCode::Graceful,
+                                DIRECT_LINK_RESTORED_REASON.to_string(),
+                            );
+                        }
+                    }
+                }
+                was_up = up;
+            }
+        })
+        .abort_handle()
     }
 
     /// Keep the endpoint public key registered with the bootstrap server's
