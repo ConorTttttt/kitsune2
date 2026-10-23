@@ -252,6 +252,10 @@ pub const RELAY_NOT_CONNECTED_ERR: &str =
 #[cfg(not(any(test, feature = "test-utils")))]
 pub(crate) const RELAY_NOT_CONNECTED_ERR: &str =
     "relay not connected, skipping to avoid false unresponsive mark";
+/// Error message returned when a direct endpoint skips a connection attempt
+/// because its own link address is not assigned to any interface.
+const DIRECT_LINK_DOWN_ERR: &str =
+    "own direct address is gone, skipping to avoid false unresponsive mark";
 
 /// IrohTransport configuration types
 pub mod config {
@@ -482,6 +486,35 @@ fn parse_direct_bind_addr(addr: &str) -> K2Result<std::net::SocketAddr> {
     Ok(addr)
 }
 
+/// The loopback socket a direct endpoint keeps beside its link socket.
+///
+/// iroh rebinds every IP socket on a network change, and shuts the whole
+/// endpoint down once all of them fail to receive in a row. A socket bound
+/// to a link address fails to rebind while that address is gone, as it is
+/// while a Wi-Fi Direct link is down. A loopback socket never loses its
+/// address, so the endpoint outlives the outage, and iroh rebinds the link
+/// socket when the address returns. Its subnet is just the loopback address
+/// itself, and it is not a default route, so iroh never sends to a peer
+/// from it. `None` when the link address is itself loopback.
+fn direct_anchor_addr(
+    addr: std::net::SocketAddr,
+) -> Option<(std::net::SocketAddr, u8)> {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    if addr.ip().is_loopback() {
+        return None;
+    }
+    Some(match addr {
+        SocketAddr::V4(_) => (SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 32),
+        SocketAddr::V6(_) => (SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 128),
+    })
+}
+
+/// Whether `ip` is currently assigned to a local interface, which is what
+/// binding a socket to it requires.
+fn is_local_addr_available(ip: std::net::IpAddr) -> bool {
+    std::net::UdpSocket::bind((ip, 0)).is_ok()
+}
+
 type Connections = ConnectionRegistry<ConnectionContext>;
 
 /// Per-space relay state: maps SpaceId to (relay URL, our local URL on that relay).
@@ -579,15 +612,30 @@ impl IrohTransport {
         } else if let Some(addr) = direct_bind_addr {
             // Direct peers are reached at their bound address, without a
             // relay, and only over the interface that owns this address.
-            Endpoint::builder(Minimal)
+            let builder = Endpoint::builder(Minimal)
                 .relay_mode(RelayMode::Disabled)
-                .clear_ip_transports()
-                .bind_addr(addr)
-                .map_err(|err| {
-                    K2Error::other(format!(
-                        "Invalid directBindAddr {addr}: {err}"
-                    ))
-                })?
+                .clear_ip_transports();
+            // The loopback socket goes first: iroh 1.2 refuses any further
+            // bind of a family once that family has a default route.
+            let builder = match direct_anchor_addr(addr) {
+                Some((anchor, prefix_len)) => builder
+                    .bind_addr_with_opts(
+                        anchor,
+                        iroh::endpoint::BindOpts::default()
+                            .set_prefix_len(prefix_len)
+                            .set_is_default_route(false)
+                            .set_is_required(false),
+                    )
+                    .map_err(|err| {
+                        K2Error::other(format!(
+                            "Binding the loopback socket beside {addr}: {err}"
+                        ))
+                    })?,
+                None => builder,
+            };
+            builder.bind_addr(addr).map_err(|err| {
+                K2Error::other(format!("Invalid directBindAddr {addr}: {err}"))
+            })?
         } else if let Some(relay_url) = &config.relay_url {
             if needs_relay_auth {
                 // Start with an empty relay map so the endpoint binds without
@@ -1039,6 +1087,24 @@ impl IrohTransport {
                  peer will not be marked unresponsive"
             );
             return Err(K2Error::other(RELAY_NOT_CONNECTED_ERR));
+        }
+
+        // Guard: a direct endpoint whose own link address is gone, say while
+        // a Wi-Fi Direct link is down, can reach no one. That is a local
+        // outage, not the peer's fault: marking the peer unresponsive would
+        // stop us dialling it after the link comes back, until its agent
+        // info expires.
+        if let Some(addr) = &self.config.direct_bind_addr
+            && let Ok(addr) = parse_direct_bind_addr(addr)
+            && !is_local_addr_available(addr.ip())
+        {
+            debug!(
+                ?remote_url,
+                %addr,
+                "skipping outbound connection: own direct address is gone, \
+                 peer will not be marked unresponsive"
+            );
+            return Err(K2Error::other(DIRECT_LINK_DOWN_ERR));
         }
 
         // Establish connection

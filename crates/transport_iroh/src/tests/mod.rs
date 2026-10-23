@@ -142,6 +142,28 @@ fn validate_rejects_direct_bind_addr_with_ble_only() {
 }
 
 #[test]
+fn direct_link_addrs_get_a_loopback_anchor_of_their_own_family() {
+    let v4 = direct_anchor_addr("192.168.137.1:47001".parse().unwrap());
+    assert_eq!(v4, Some(("127.0.0.1:0".parse().unwrap(), 32)));
+    let v6 = direct_anchor_addr("[fd00::1]:47001".parse().unwrap());
+    assert_eq!(v6, Some(("[::1]:0".parse().unwrap(), 128)));
+}
+
+#[test]
+fn loopback_direct_addrs_need_no_anchor() {
+    assert_eq!(direct_anchor_addr("127.0.0.1:47001".parse().unwrap()), None);
+    assert_eq!(direct_anchor_addr("127.0.0.2:47001".parse().unwrap()), None);
+    assert_eq!(direct_anchor_addr("[::1]:47001".parse().unwrap()), None);
+}
+
+#[test]
+fn local_addr_availability_follows_interface_addresses() {
+    assert!(is_local_addr_available("127.0.0.1".parse().unwrap()));
+    // TEST-NET-1 (RFC 5737) is never assigned to a local interface.
+    assert!(!is_local_addr_available("192.0.2.1".parse().unwrap()));
+}
+
+#[test]
 fn validate_allowed_plain_text_relay_url() {
     let builder = Builder {
         transport: IrohTransportFactory::create(),
