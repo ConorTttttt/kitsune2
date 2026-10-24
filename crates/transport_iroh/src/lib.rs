@@ -221,6 +221,13 @@ use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "ble")]
 mod ble;
+#[cfg(feature = "custom-transport")]
+mod custom;
+#[cfg(feature = "custom-transport")]
+pub use custom::{
+    CustomTransportFactory, register_custom_transport,
+    unregister_custom_transport,
+};
 mod close_code;
 mod frame;
 use frame::*;
@@ -347,6 +354,22 @@ pub mod config {
         #[serde(default)]
         #[cfg_attr(feature = "schema", schemars(default))]
         pub direct_bind_addr: Option<String>,
+
+        /// Use the custom iroh transport the application registered under
+        /// this name, with `register_custom_transport`, as the only
+        /// transport.
+        ///
+        /// The endpoint then has no IP sockets and no relay, and
+        /// `relay_url` is ignored. Peers are reached by endpoint ID through
+        /// the transport's address lookup, and their URLs take the form
+        /// `https://<name>.invalid:443/<endpoint-id>`. Requires the
+        /// `custom-transport` feature. Can not be combined with `ble_only`
+        /// or `direct_bind_addr`.
+        ///
+        /// Default: `None`.
+        #[serde(default)]
+        #[cfg_attr(feature = "schema", schemars(default))]
+        pub custom_transport: Option<String>,
     }
 
     fn default_relay_keepalive_interval_s() -> u32 {
@@ -365,6 +388,7 @@ pub mod config {
                 ),
                 ble_only: false,
                 direct_bind_addr: None,
+                custom_transport: None,
             }
         }
     }
@@ -421,6 +445,27 @@ impl TransportFactory for IrohTransportFactory {
                 ));
             }
             parse_direct_bind_addr(addr)?;
+        }
+
+        if let Some(name) = &config.iroh_transport.custom_transport {
+            if !cfg!(feature = "custom-transport") {
+                return Err(K2Error::other(
+                    "customTransport is set, but the iroh transport was built \
+                     without the custom-transport feature",
+                ));
+            }
+            if config.iroh_transport.ble_only
+                || config.iroh_transport.direct_bind_addr.is_some()
+            {
+                return Err(K2Error::other(
+                    "customTransport can not be combined with bleOnly or \
+                     directBindAddr",
+                ));
+            }
+            #[cfg(feature = "custom-transport")]
+            custom::check_name(name)?;
+            #[cfg(not(feature = "custom-transport"))]
+            let _ = name;
         }
 
         if let Some(relay) = &config.iroh_transport.relay_url {
@@ -611,13 +656,16 @@ impl IrohTransport {
 
         let needs_relay_auth = !config.ble_only
             && direct_bind_addr.is_none()
+            && config.custom_transport.is_none()
             && config.relay_url.is_some()
             && auth_material.is_some();
 
         // If a relay server is configured, only use that.
         // Otherwise, use the default relay servers provided by n0.
         // BLE reaches peers without a relay.
-        let mut builder = if config.ble_only {
+        let mut builder = if config.ble_only
+            || config.custom_transport.is_some()
+        {
             Endpoint::builder(Minimal).relay_mode(RelayMode::Disabled)
         } else if let Some(addr) = direct_bind_addr {
             // Direct peers are reached at their bound address, without a
@@ -693,6 +741,26 @@ impl IrohTransport {
             Some(ble)
         } else {
             None
+        };
+
+        #[cfg(feature = "custom-transport")]
+        let custom_url = match &config.custom_transport {
+            Some(name) => {
+                let (custom_builder, url) = custom::attach(name, builder)?;
+                builder = custom_builder;
+                Some(url)
+            }
+            None => None,
+        };
+        #[cfg(not(feature = "custom-transport"))]
+        let custom_url: Option<Url> = match &config.custom_transport {
+            Some(_) => {
+                return Err(K2Error::other(
+                    "customTransport is set, but the iroh transport was built \
+                     without the custom-transport feature",
+                ));
+            }
+            None => None,
         };
 
         let endpoint = builder.bind().await.map_err(|err| {
@@ -778,14 +846,17 @@ impl IrohTransport {
 
         let endpoint = Arc::new(IrohEndpoint::new(endpoint));
 
-        // A BLE or direct endpoint is reachable at its URL as soon as it is
-        // bound. A relay endpoint learns its URL from the relay, see the
-        // watcher task.
+        // A BLE, custom or direct endpoint is reachable at its URL as soon
+        // as it is bound. A relay endpoint learns its URL from the relay,
+        // see the watcher task.
         #[cfg(feature = "ble")]
-        let initial_url =
-            ble.as_ref().map(|ble| ble.url().clone()).or(direct_url);
+        let initial_url = ble
+            .as_ref()
+            .map(|ble| ble.url().clone())
+            .or(custom_url)
+            .or(direct_url);
         #[cfg(not(feature = "ble"))]
-        let initial_url = direct_url;
+        let initial_url = custom_url.or(direct_url);
         let local_url = Arc::new(RwLock::new(initial_url));
         let connections = ConnectionRegistry::new();
         let connection_locks = Arc::new(Mutex::new(HashMap::new()));
@@ -1576,21 +1647,20 @@ impl TxImp for IrohTransport {
                 })
                 .collect();
             #[cfg(feature = "ble")]
-            let backend = if self.ble.is_some() {
-                "iroh-ble"
-            } else if self.config.direct_bind_addr.is_some() {
-                "iroh-direct"
-            } else {
-                "iroh"
-            };
+            let ble = self.ble.is_some();
             #[cfg(not(feature = "ble"))]
-            let backend = if self.config.direct_bind_addr.is_some() {
-                "iroh-direct"
+            let ble = false;
+            let backend = if ble {
+                "iroh-ble".to_string()
+            } else if let Some(name) = &self.config.custom_transport {
+                format!("iroh-{name}")
+            } else if self.config.direct_bind_addr.is_some() {
+                "iroh-direct".to_string()
             } else {
-                "iroh"
+                "iroh".to_string()
             };
             Ok(TransportStats {
-                backend: backend.to_string(),
+                backend,
                 peer_urls,
                 connections: stat_connections,
             })
@@ -1602,9 +1672,12 @@ impl TxImp for IrohTransport {
         space_id: SpaceId,
         config: &Config,
     ) -> BoxFut<'_, K2Result<()>> {
-        // BLE and direct endpoints reach peers without relays, so there is
-        // none to configure.
-        if self.config.ble_only || self.config.direct_bind_addr.is_some() {
+        // BLE, custom and direct endpoints reach peers without relays, so
+        // there is none to configure.
+        if self.config.ble_only
+            || self.config.custom_transport.is_some()
+            || self.config.direct_bind_addr.is_some()
+        {
             return Box::pin(async { Ok(()) });
         }
 

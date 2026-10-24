@@ -1,9 +1,10 @@
 use crate::IrohTransport;
 use crate::url::endpoint_from_url;
 use crate::url::{
-    SpaceRelay, ble_peer_url, canonicalize_relay_url, direct_peer_addr,
-    direct_peer_url, get_url_with_first_relay, is_ble_peer_url,
-    is_transport_own_relay, per_space_relay,
+    SpaceRelay, ble_peer_url, canonicalize_relay_url, custom_peer_url,
+    direct_peer_addr, direct_peer_url, get_url_with_first_relay,
+    is_addressless_peer_url, is_ble_peer_url, is_transport_own_relay,
+    per_space_relay,
 };
 use iroh::{EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use kitsune2_api::{Id, SpaceId, Url};
@@ -669,4 +670,34 @@ fn is_transport_own_relay_ignores_trailing_slashes() {
 #[test]
 fn is_transport_own_relay_is_false_without_a_transport_relay() {
     assert!(!is_transport_own_relay("https://relay.example", None));
+}
+
+#[test]
+fn custom_peer_url_is_addressless_and_names_the_endpoint() {
+    let endpoint_id = test_endpoint_id();
+    let url = custom_peer_url("rfcomm", endpoint_id).unwrap();
+    assert_eq!(
+        url.as_str(),
+        format!("https://rfcomm.invalid:443/{endpoint_id}")
+    );
+    assert_eq!(url.peer_id(), Some(endpoint_id.to_string().as_str()));
+    assert!(is_addressless_peer_url(&url));
+    assert!(!is_ble_peer_url(&url));
+    let addr = endpoint_from_url(&url).unwrap();
+    assert_eq!(addr.id, endpoint_id);
+    assert_eq!(addr.addrs.len(), 0, "{addr:?}");
+}
+
+#[test]
+fn ble_urls_are_addressless_but_relay_and_direct_urls_are_not() {
+    let endpoint_id = test_endpoint_id();
+    assert!(is_addressless_peer_url(&ble_peer_url(endpoint_id).unwrap()));
+    for url in [
+        format!("https://example.com:443/{endpoint_id}"),
+        format!("https://relay.invalid.example.com:443/{endpoint_id}"),
+        format!("http://192.168.137.1:47001/direct/{endpoint_id}"),
+    ] {
+        let url = Url::from_str(url).unwrap();
+        assert!(!is_addressless_peer_url(&url), "{url}");
+    }
 }

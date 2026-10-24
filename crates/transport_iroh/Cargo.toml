@@ -72,3 +72,7 @@ metrics = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
 # Bluetooth Low Energy as the only transport, enabled at runtime with the
 # `bleOnly` config field.
 ble = ["dep:iroh-ble-transport", "iroh/unstable-custom-transports"]
+
+# A custom iroh transport the application registers, enabled at runtime with
+# the `customTransport` config field.
+custom-transport = ["iroh/unstable-custom-transports"]

@@ -73,6 +73,7 @@ pub(super) fn relay_url_from_peer_url(url: &Url) -> K2Result<RelayUrl> {
 /// endpoint ID alone, which the BLE address lookup resolves to a radio link.
 /// The `.invalid` TLD never resolves, so a BLE URL can not be mistaken for a
 /// reachable relay.
+#[cfg(any(test, feature = "ble"))]
 pub(super) const BLE_PEER_ADDR: &str = "ble.invalid:443";
 
 /// Construct the kitsune2 peer URL of an endpoint reached over BLE.
@@ -82,8 +83,31 @@ pub(super) fn ble_peer_url(endpoint_id: EndpointId) -> K2Result<Url> {
 }
 
 /// Whether a kitsune2 peer URL names a peer reached over BLE.
+#[cfg(test)]
 pub(super) fn is_ble_peer_url(url: &Url) -> bool {
     url.addr() == BLE_PEER_ADDR
+}
+
+/// Construct the kitsune2 peer URL of an endpoint reached over the custom
+/// transport registered as `name`.
+///
+/// Like a BLE URL, it carries no address: the transport's address lookup
+/// resolves the endpoint ID.
+#[cfg(any(test, feature = "custom-transport"))]
+pub(super) fn custom_peer_url(
+    name: &str,
+    endpoint_id: EndpointId,
+) -> K2Result<Url> {
+    Url::from_str(format!("https://{name}.invalid:443/{endpoint_id}"))
+}
+
+/// Whether a kitsune2 peer URL names a peer reached by endpoint ID alone,
+/// over BLE or a custom transport: its host is under the `.invalid` TLD,
+/// which never resolves, so it can not be a relay.
+pub(super) fn is_addressless_peer_url(url: &Url) -> bool {
+    url.addr()
+        .strip_suffix(":443")
+        .is_some_and(|host| host.ends_with(".invalid"))
 }
 
 /// Path segment that marks a peer URL as the direct IP socket address of an
@@ -119,8 +143,9 @@ pub(super) fn direct_peer_addr(url: &Url) -> Option<SocketAddr> {
 /// extracted directly: everything before the last path segment is the
 /// relay URL, and the last segment is the endpoint ID.
 ///
-/// A BLE peer URL yields an address with no transport addresses, so that
-/// iroh asks the BLE address lookup for a path to the endpoint. A direct peer
+/// A BLE or custom transport peer URL yields an address with no transport
+/// addresses, so that iroh asks that transport's address lookup for a path
+/// to the endpoint. A direct peer
 /// URL yields its socket address and nothing else.
 pub(super) fn endpoint_from_url(url: &Url) -> K2Result<EndpointAddr> {
     let peer_id = url
@@ -130,7 +155,7 @@ pub(super) fn endpoint_from_url(url: &Url) -> K2Result<EndpointAddr> {
         K2Error::other_src("failed to convert peer id to endpoint id", err)
     })?;
 
-    if is_ble_peer_url(url) {
+    if is_addressless_peer_url(url) {
         return Ok(EndpointAddr::new(endpoint_id));
     }
 
