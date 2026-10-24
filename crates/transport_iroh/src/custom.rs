@@ -13,8 +13,8 @@
 //! that crosses the conductor's config, and a transport is not.
 
 use crate::url::custom_peer_url;
-use iroh::SecretKey;
 use iroh::endpoint::Builder;
+use iroh::{EndpointId, SecretKey};
 use kitsune2_api::{K2Error, K2Result, Url};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -36,6 +36,19 @@ pub trait CustomTransportFactory:
         builder: Builder,
         secret_key: &SecretKey,
     ) -> K2Result<Builder>;
+
+    /// Endpoints whose link the transport has restored after an outage.
+    ///
+    /// A QUIC connection that lived through an outage can come back
+    /// half-working, with data flowing one way only, as in direct mode. For
+    /// each endpoint received, kitsune2 closes its connection to that peer,
+    /// so that the next message makes a new one. Called once, while the
+    /// endpoint is built. The default is no signal.
+    fn restored_links(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<EndpointId>> {
+        None
+    }
 }
 
 static FACTORIES: LazyLock<
@@ -96,12 +109,20 @@ fn factory(name: &str) -> K2Result<Arc<dyn CustomTransportFactory>> {
         })
 }
 
+/// What attaching a custom transport gives the endpoint being built.
+pub(crate) struct Attached {
+    /// The builder to bind the endpoint with.
+    pub builder: Builder,
+    /// The peer URL the endpoint is reachable at once bound.
+    pub url: Url,
+    /// See [`CustomTransportFactory::restored_links`].
+    pub restored_links:
+        Option<tokio::sync::mpsc::UnboundedReceiver<EndpointId>>,
+}
+
 /// Make the custom transport registered under `name` the only transport of
 /// the endpoint being built.
-///
-/// Returns the builder to bind the endpoint with, and the peer URL the
-/// endpoint is reachable at once bound.
-pub(crate) fn attach(name: &str, builder: Builder) -> K2Result<(Builder, Url)> {
+pub(crate) fn attach(name: &str, builder: Builder) -> K2Result<Attached> {
     check_name(name)?;
     let factory = factory(name)?;
     // The transport may need to know its endpoint ID before the endpoint is
@@ -114,5 +135,14 @@ pub(crate) fn attach(name: &str, builder: Builder) -> K2Result<(Builder, Url)> {
         .clear_relay_transports();
     let url = custom_peer_url(name, endpoint_id)?;
     info!(%url, transport = name, "A custom transport is the only transport");
-    Ok((builder, url))
+    Ok(Attached {
+        builder,
+        url,
+        restored_links: factory.restored_links(),
+    })
+}
+
+/// The URL a peer on the custom transport `name` has.
+pub(crate) fn peer_url(name: &str, endpoint_id: EndpointId) -> K2Result<Url> {
+    custom_peer_url(name, endpoint_id)
 }

@@ -17,14 +17,32 @@ use kitsune2_transport_iroh::{
     IrohTransportModConfig, register_custom_transport,
     test_utils::MockTxHandler,
 };
-use std::sync::Arc;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::mpsc::{
+    UnboundedReceiver, UnboundedSender, unbounded_channel,
+};
 
-/// Puts every endpoint it is asked for on one in-memory network.
+/// Puts every endpoint it is asked for on one in-memory network. The first
+/// endpoint built also gets a "link restored" signal the test can fire.
 #[derive(Debug, Default)]
 struct TestNetworkFactory {
     network: TestNetwork,
+    restored: Mutex<Option<UnboundedReceiver<iroh::EndpointId>>>,
+}
+
+impl TestNetworkFactory {
+    fn with_restore_signal() -> (Self, UnboundedSender<iroh::EndpointId>) {
+        let (tx, rx) = unbounded_channel();
+        (
+            Self {
+                network: TestNetwork::new(),
+                restored: Mutex::new(Some(rx)),
+            },
+            tx,
+        )
+    }
 }
 
 impl CustomTransportFactory for TestNetworkFactory {
@@ -41,12 +59,17 @@ impl CustomTransportFactory for TestNetworkFactory {
             .add_custom_transport(transport)
             .address_lookup(self.network.address_lookup()))
     }
+
+    fn restored_links(&self) -> Option<UnboundedReceiver<iroh::EndpointId>> {
+        self.restored.lock().expect("poisoned").take()
+    }
 }
 
 struct Node {
     transport: DynTransport,
     url: Url,
     received: UnboundedReceiver<(Url, Bytes)>,
+    disconnects: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 fn builder(custom_transport: Option<&str>) -> Builder {
@@ -76,10 +99,15 @@ async fn custom_node(name: &str) -> Node {
     let builder = Arc::new(builder);
 
     let (sender, received) = unbounded_channel();
+    let disconnects = Arc::new(Mutex::new(Vec::new()));
+    let reasons = disconnects.clone();
     let handler = Arc::new(MockTxHandler {
         recv_space_notify: Arc::new(move |peer, _space_id, data| {
             sender.send((peer, data)).unwrap();
             Ok(())
+        }),
+        peer_disconnect: Arc::new(move |_peer, reason| {
+            reasons.lock().expect("poison").push(reason);
         }),
         ..Default::default()
     });
@@ -96,6 +124,7 @@ async fn custom_node(name: &str) -> Node {
         transport,
         url,
         received,
+        disconnects,
     }
 }
 
@@ -154,6 +183,70 @@ async fn custom_nodes_exchange_messages_both_ways_by_endpoint_id() {
         .await
         .unwrap();
     expect_notify(&mut node_1, &node_2.url, b"two to one").await;
+}
+
+/// A connection that lived through an outage can come back half-working, so
+/// when the transport says it restored a peer's link, kitsune2 closes that
+/// connection and the next message makes a new one.
+#[tokio::test]
+async fn a_restored_link_makes_a_fresh_connection() {
+    enable_tracing();
+    let (factory, restore) = TestNetworkFactory::with_restore_signal();
+    register_custom_transport("test-restore", Arc::new(factory)).unwrap();
+    let mut node_1 = custom_node("test-restore").await;
+    let mut node_2 = custom_node("test-restore").await;
+
+    node_1
+        .transport
+        .send_space_notify(
+            node_2.url.clone(),
+            TEST_SPACE_ID,
+            Bytes::from_static(b"before"),
+        )
+        .await
+        .unwrap();
+    expect_notify(&mut node_2, &node_1.url, b"before").await;
+
+    let node_2_id =
+        iroh::EndpointId::from_str(node_2.url.peer_id().unwrap()).unwrap();
+    restore.send(node_2_id).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if node_1
+                .disconnects
+                .lock()
+                .expect("poison")
+                .iter()
+                .any(|r| r.as_deref() == Some("link restored, reconnecting"))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("node 1 did not close its connection to the restored peer");
+
+    node_1
+        .transport
+        .send_space_notify(
+            node_2.url.clone(),
+            TEST_SPACE_ID,
+            Bytes::from_static(b"after, one to two"),
+        )
+        .await
+        .unwrap();
+    expect_notify(&mut node_2, &node_1.url, b"after, one to two").await;
+    node_2
+        .transport
+        .send_space_notify(
+            node_1.url.clone(),
+            TEST_SPACE_ID,
+            Bytes::from_static(b"after, two to one"),
+        )
+        .await
+        .unwrap();
+    expect_notify(&mut node_1, &node_2.url, b"after, two to one").await;
 }
 
 #[tokio::test]

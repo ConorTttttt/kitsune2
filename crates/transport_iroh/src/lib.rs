@@ -267,6 +267,9 @@ const DIRECT_LINK_DOWN_ERR: &str =
 const DIRECT_LINK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// Close reason sent to peers when the link address returns.
 const DIRECT_LINK_RESTORED_REASON: &str = "direct link restored, reconnecting";
+/// The close reason when a custom transport restored the link to a peer.
+#[cfg(feature = "custom-transport")]
+const CUSTOM_LINK_RESTORED_REASON: &str = "link restored, reconnecting";
 
 /// IrohTransport configuration types
 pub mod config {
@@ -599,7 +602,8 @@ struct IrohTransport {
     accept_task: AbortHandle,
     relay_keepalive_task: Option<AbortHandle>,
     /// In direct mode, watches the link address; see
-    /// [`IrohTransport::spawn_direct_link_task`].
+    /// [`IrohTransport::spawn_direct_link_task`]. In custom mode, closes
+    /// connections whose links the transport restored.
     direct_link_task: Option<AbortHandle>,
     /// Keepalive tasks for per-space relays, keyed by relay URL.
     space_relay_keepalives: Arc<Mutex<HashMap<RelayUrl, AbortHandle>>>,
@@ -744,13 +748,13 @@ impl IrohTransport {
         };
 
         #[cfg(feature = "custom-transport")]
-        let custom_url = match &config.custom_transport {
+        let (custom_url, restored_links) = match &config.custom_transport {
             Some(name) => {
-                let (custom_builder, url) = custom::attach(name, builder)?;
-                builder = custom_builder;
-                Some(url)
+                let attached = custom::attach(name, builder)?;
+                builder = attached.builder;
+                (Some(attached.url), attached.restored_links)
             }
-            None => None,
+            None => (None, None),
         };
         #[cfg(not(feature = "custom-transport"))]
         let custom_url: Option<Url> = match &config.custom_transport {
@@ -909,6 +913,17 @@ impl IrohTransport {
         let direct_link_task = direct_bind_addr.map(|addr| {
             Self::spawn_direct_link_task(addr.ip(), connections.clone())
         });
+        #[cfg(feature = "custom-transport")]
+        let direct_link_task = direct_link_task.or_else(|| {
+            let name = config.custom_transport.clone()?;
+            restored_links.map(|restored| {
+                Self::spawn_custom_link_task(
+                    name,
+                    restored,
+                    connections.clone(),
+                )
+            })
+        });
 
         let out = Arc::new(Self {
             endpoint,
@@ -966,6 +981,36 @@ impl IrohTransport {
                     }
                 }
                 was_up = up;
+            }
+        })
+        .abort_handle()
+    }
+
+    /// For each peer whose custom transport link came back after an outage,
+    /// close the connection, so that the next message makes a new one. See
+    /// [`custom::CustomTransportFactory::restored_links`] and
+    /// [`IrohTransport::spawn_direct_link_task`].
+    #[cfg(feature = "custom-transport")]
+    fn spawn_custom_link_task(
+        name: String,
+        mut restored: tokio::sync::mpsc::UnboundedReceiver<EndpointId>,
+        connections: Connections,
+    ) -> AbortHandle {
+        tokio::spawn(async move {
+            while let Some(endpoint_id) = restored.recv().await {
+                let Ok(peer) = custom::peer_url(&name, endpoint_id) else {
+                    continue;
+                };
+                if let Some(ctx) = connections.take(&peer) {
+                    info!(
+                        %peer,
+                        "Custom transport link restored; reconnecting to peer"
+                    );
+                    ctx.disconnect(
+                        close_code::CloseCode::Graceful,
+                        CUSTOM_LINK_RESTORED_REASON.to_string(),
+                    );
+                }
             }
         })
         .abort_handle()
